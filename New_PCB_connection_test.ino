@@ -37,6 +37,7 @@ void setup() {
   disableotherchannel(0x73);
   delay(200);
   for (int i = 0; i<8; i++){
+    singleActuator(i);
     HMD[i].begin();
     HMD[i].writeDRV2605L(OVERDRIVECLAMP_REG,0xFF);
     HMD[i].Mode(0x05);
