@@ -9,644 +9,619 @@ import glob
 import traceback
 
 
-def get_quadrant(x, y):
-    """
-    Determines which quadrant of the screen the user is looking at based on normalized X/Y coordinates.
-
-    Args:
-        x (float): Normalized X coordinate (0.0 to 1.0).
-        y (float): Normalized Y coordinate (0.0 to 1.0).
-
-    Returns:
-        str: 'Top-Left', 'Top-Right', 'Bottom-Left', 'Bottom-Right', or None if off-screen.
-    """
-    try:
-        x_val = float(x)
-        y_val = float(y)
-    except (ValueError, TypeError):
-        return None
-
-    # Check if gaze is within valid screen bounds
-    if not (0.0 <= x_val <= 1.0 and 0.0 <= y_val <= 1.0):
-        return None
-
-    # Determine specific quadrant
-    if x_val < 0.5:
-        if y_val < 0.5:
-            return "Top-Left"
-        else:
-            return "Bottom-Left"
-    else:
-        if y_val < 0.6:
-            return "Top-Right"
-        else:
-            return "Bottom-Right"
-
+# --- HELPERS ---
 
 def find_lsl_file_for_trial(lsl_dir, trial_num):
-    """
-    Locates the specific LSL synchronization CSV file for a given trial number.
-
-    Args:
-        lsl_dir (str): Directory containing LSL files.
-        trial_num (int): The trial number to look for.
-
-    Returns:
-        str: Path to the matching LSL file, or None if not found.
-    """
     try:
         clean_trial_num = int(trial_num)
+        # Look for standard LSL naming convention
         pattern = os.path.join(lsl_dir, f"*_{clean_trial_num:03d}_lsl.csv")
         matches = glob.glob(pattern)
-
-        if not matches:
-            return None
-        return matches[0]
-    except (ValueError, TypeError):
+        return matches[0] if matches else None
+    except:
         return None
 
 
+def calculate_offset_via_fingerprint(lsl_path, gaze_df, sequence_length=500):
+    """
+    Finds the exact time offset between LSL (ROS time) and Glasses (ns)
+    using a coarse-to-fine shape matching approach.
+    """
+    try:
+        lsl_df = pd.read_csv(lsl_path)
+        if lsl_df.empty: return None
+
+        # Identify columns based on unit type
+        lsl_x, lsl_y = 'neon_ch0', 'neon_ch1'
+        if 'gaze x [normalized]' in gaze_df.columns:
+            gaze_x, gaze_y = 'gaze x [normalized]', 'gaze y [normalized]'
+        else:
+            gaze_x, gaze_y = 'gaze x [px]', 'gaze y [px]'
+
+        lsl_arr = lsl_df[[lsl_x, lsl_y]].values
+        gaze_arr = gaze_df[[gaze_x, gaze_y]].values
+
+        # Grab a template chunk from LSL.
+        # Offset by 200 samples to avoid startup flatlines/noise.
+        start_offset = 200
+        if len(lsl_arr) < start_offset + sequence_length:
+            return None
+
+        template = lsl_arr[start_offset: start_offset + sequence_length]
+
+        # Normalize template (0-1) to handle unit mismatch
+        t_min, t_max = template.min(axis=0), template.max(axis=0)
+        template_norm = (template - t_min) / (t_max - t_min + 1e-9)
+
+        gaze_len = len(gaze_arr)
+
+        # --- PASS 1: Coarse Search (Speed) ---
+        # Skip 100 samples at a time to find the rough neighborhood
+        coarse_stride = 100
+        best_coarse_err = float('inf')
+        best_coarse_idx = -1
+
+        for i in range(0, gaze_len - sequence_length, coarse_stride):
+            segment = gaze_arr[i: i + sequence_length]
+
+            # Local normalization
+            s_min, s_max = segment.min(axis=0), segment.max(axis=0)
+            segment_norm = (segment - s_min) / (s_max - s_min + 1e-9)
+
+            error = np.mean(np.abs(segment_norm - template_norm))
+
+            if error < best_coarse_err:
+                best_coarse_err = error
+                best_coarse_idx = i
+
+        if best_coarse_idx == -1: return None
+
+        # --- PASS 2: Fine Search (Precision) ---
+        # Search every sample around the coarse match
+        radius = coarse_stride
+        start_fine = max(0, best_coarse_idx - radius)
+        end_fine = min(gaze_len - sequence_length, best_coarse_idx + radius)
+
+        best_fine_err = float('inf')
+        best_fine_idx = -1
+
+        for i in range(start_fine, end_fine):
+            segment = gaze_arr[i: i + sequence_length]
+
+            # Re-normalize for exact precision
+            s_min, s_max = segment.min(axis=0), segment.max(axis=0)
+            segment_norm = (segment - s_min) / (s_max - s_min + 1e-9)
+
+            error = np.mean(np.abs(segment_norm - template_norm))
+
+            if error < best_fine_err:
+                best_fine_err = error
+                best_fine_idx = i
+
+        # Calculate final offset if match is found
+        if best_fine_idx != -1:
+            lsl_ros_time = lsl_df.iloc[start_offset]['ros_time']
+            gaze_ns = gaze_df.iloc[best_fine_idx]['timestamp [ns]']
+            ros_ns = int(lsl_ros_time * 1e9)
+
+            return gaze_ns - ros_ns
+
+        return None
+    except Exception:
+        return None
+
+
+def get_quadrant(x, y):
+    # Maps normalized coords (0-1) to screen quadrants
+    try:
+        x, y = float(x), float(y)
+    except:
+        return None
+
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0): return None
+
+    if x < 0.5:
+        return "Top-Left" if y < 0.5 else "Bottom-Left"
+    else:
+        return "Top-Right" if y < 0.6 else "Bottom-Right"
+
+
+# --- ANALYSIS & PLOTTING ---
+
 def generate_summary_stats(merged_df, eye_df, saccades_df, imu_df, output_dir, trial_name):
-    """
-    Calculates statistical averages and peaks for key metrics (pupil, aperture, head velocity)
-    and saves them to a single-row CSV summary file.
-
-    Args:
-        merged_df (pd.DataFrame): Dataframe containing fixation events.
-        eye_df (pd.DataFrame): Raw eye data (aperture/pupil).
-        saccades_df (pd.DataFrame): Saccade events.
-        imu_df (pd.DataFrame): Head movement data.
-        output_dir (str): Folder to save the output CSV.
-        trial_name (str): Identifier for the file name.
-
-    Returns:
-        pd.DataFrame: A single-row dataframe containing the calculated stats.
-    """
+    # Saves a small CSV with average durations, diameters, velocities, etc.
     stats = {}
     try:
-        # Eye Metrics
         if eye_df is not None and not eye_df.empty:
             stats['avg_eyelid_aperture_mm'] = float(eye_df['eyelid_aperture_avg'].mean())
-            stats['peak_eyelid_aperture_mm'] = float(eye_df['eyelid_aperture_avg'].max())
             stats['avg_pupil_diameter_mm'] = float(eye_df['pupil_diameter_avg'].mean())
-            stats['peak_pupil_diameter_mm'] = float(eye_df['pupil_diameter_avg'].max())
 
-        # Fixation Metrics
         if merged_df is not None and not merged_df.empty:
             stats['avg_fixation_duration_s'] = float(merged_df['duration_sec'].mean())
             stats['peak_fixation_duration_s'] = float(merged_df['duration_sec'].max())
+            stats['total_fixations'] = len(merged_df)
 
-        # Saccade Metrics
-        if saccades_df is not None and not saccades_df.empty and 'peak velocity [px/s]' in saccades_df.columns:
-            stats['avg_saccadic_velocity_px_s'] = float(saccades_df['peak velocity [px/s]'].mean())
-            stats['peak_saccadic_velocity_px_s'] = float(saccades_df['peak velocity [px/s]'].max())
+        if saccades_df is not None and not saccades_df.empty:
+            # Handle variable column names for velocity
+            vel_col = next((c for c in ['peak velocity [px/s]', 'peak velocity [deg/s]', 'velocity']
+                            if c in saccades_df.columns), None)
+            if vel_col:
+                stats['avg_saccadic_velocity'] = float(saccades_df[vel_col].mean())
+                stats['peak_saccadic_velocity'] = float(saccades_df[vel_col].max())
+                stats['velocity_unit'] = vel_col
 
-        # Head Movement Metrics
-        if imu_df is not None and not imu_df.empty and 'head_angular_velocity' in imu_df.columns:
-            stats['avg_head_velocity_deg_s'] = float(imu_df['head_angular_velocity'].mean())
-            stats['peak_head_velocity_deg_s'] = float(imu_df['head_angular_velocity'].max())
+        if not stats: return None
 
-        if not stats:
-            return None
-
-        # Save to CSV
-        summary_df = pd.DataFrame([stats])
-        summary_filepath = os.path.join(output_dir, f"{trial_name}_key_metrics.csv")
-        summary_df.to_csv(summary_filepath, index=False)
-        return summary_df
-
+        pd.DataFrame([stats]).to_csv(os.path.join(output_dir, f"{trial_name}_key_metrics.csv"), index=False)
+        return True
     except Exception as e:
-        print(f"   [ERROR] Failed to generate summary stats: {e}")
+        print(f"   Stats generation failed: {e}")
         return None
 
 
-def analyze_trial(
-        trial_name: str,
-        main_df: pd.DataFrame,
-        surface_df: pd.DataFrame,
-        eye_df: pd.DataFrame,
-        blinks_df: pd.DataFrame,
-        saccades_df: pd.DataFrame,
-        imu_df: pd.DataFrame,
-        trial_keys: pd.DataFrame,
-        output_dir: str
-):
-    """
-    Core analysis function for a single trial (or baseline period).
-
-    1. Pre-processes all data streams to start at t=0.0s.
-    2. Merges distinct sensor streams (Eye, IMU, Keys) into one continuous timeseries CSV.
-    3. Generates a visual timeline plot of attention and physiological metrics.
-    4. Computes summary statistics.
-    """
-
+def analyze_trial(trial_name, main_df, surface_df, eye_df, blinks_df, saccades_df, imu_df, gaze_df, trial_keys,
+                  output_dir):
     if main_df.empty:
-        print("   [CRITICAL WARNING] Trial Slice is EMPTY (No fixations found).")
-        return None
+        print("   Warning: Fixation slice is empty.")
 
     try:
-
-        # Determine "Time Zero": Use the very first eye frame in the slice as t=0.0
+        # Determine T=0 (start of slice)
         start_time_ns = 0.0
         if eye_df is not None and not eye_df.empty:
             start_time_ns = float(eye_df['timestamp [ns]'].min())
         elif not main_df.empty:
             start_time_ns = float(main_df['start timestamp [ns]'].min())
 
-        # Process Eye Data (Calculate Left/Right Averages)
+        # --- 1. PREP STREAMS ---
+
+        # Eye states (Pupil/Aperture)
         if eye_df is not None and not eye_df.empty:
             eye_df = eye_df.copy()
             eye_df['time_sec'] = (eye_df['timestamp [ns]'] - start_time_ns) * 1e-9
+            # Average L/R eyes
             eye_df['pupil_diameter_avg'] = eye_df[['pupil diameter left [mm]', 'pupil diameter right [mm]']].mean(
                 axis=1)
             eye_df['eyelid_aperture_avg'] = eye_df[['eyelid aperture left [mm]', 'eyelid aperture right [mm]']].mean(
                 axis=1)
 
-        # Process IMU Data (Calculate Angular Velocity Magnitude)
-        head_velocity_available = False
+        # Raw Gaze
+        gaze_ok = False
+        if gaze_df is not None and not gaze_df.empty:
+            gaze_df = gaze_df.copy()
+            gaze_df['time_sec'] = (gaze_df['timestamp [ns]'] - start_time_ns) * 1e-9
+
+            cols = ['time_sec']
+            if 'gaze x [px]' in gaze_df.columns:
+                cols.extend(['gaze x [px]', 'gaze y [px]'])
+            elif 'gaze x [normalized]' in gaze_df.columns:
+                cols.extend(['gaze x [normalized]', 'gaze y [normalized]'])
+
+            gaze_stream = gaze_df[cols].sort_values('time_sec')
+            gaze_ok = True
+
+        # IMU
+        head_vel_ok = False
         if imu_df is not None and not imu_df.empty:
             imu_df = imu_df.copy()
             imu_df['time_sec'] = (imu_df['timestamp [ns]'] - start_time_ns) * 1e-9
-            gyro_cols = ['gyro x [deg/s]', 'gyro y [deg/s]', 'gyro z [deg/s]']
-            if all(col in imu_df.columns for col in gyro_cols):
-                imu_df['head_angular_velocity'] = np.linalg.norm(imu_df[gyro_cols].values, axis=1)
-                head_velocity_available = True
 
-        # Process Keystroke Data
-        keys_available = False
+            gyro_cols = ['gyro x [deg/s]', 'gyro y [deg/s]', 'gyro z [deg/s]']
+            if all(c in imu_df.columns for c in gyro_cols):
+                imu_df['head_angular_velocity'] = np.linalg.norm(imu_df[gyro_cols].values, axis=1)
+                head_vel_ok = True
+
+        # Keys
+        keys_ok = False
         if trial_keys is not None and not trial_keys.empty:
             trial_keys = trial_keys.copy()
             trial_keys['time_sec'] = (trial_keys['timestamp [ns]'] - start_time_ns) * 1e-9
-            # Normalize column names
+            # Prioritize event label over key code
             if 'event' in trial_keys.columns:
-                trial_keys = trial_keys[['time_sec', 'event']].rename(columns={'event': 'button_pressed'})
+                trial_keys['button_pressed'] = trial_keys['event']
+                keys_ok = True
             elif 'key' in trial_keys.columns:
-                trial_keys = trial_keys[['time_sec', 'key']].rename(columns={'key': 'button_pressed'})
-            keys_available = True
+                trial_keys['button_pressed'] = trial_keys['key']
+                keys_ok = True
 
-        # Process Fixations & Map Quadrants
-        surface_df = surface_df.copy()
-        main_df = main_df.copy()
+        # Fixations & Surfaces
+        merged_df = pd.DataFrame()
+        if not main_df.empty and not surface_df.empty:
+            surface_df = surface_df.copy()
+            # Map coords to quadrants
+            surface_df['quadrant'] = surface_df.apply(
+                lambda r: get_quadrant(r['fixation x [normalized]'], r['fixation y [normalized]']), axis=1)
 
-        surface_df['quadrant'] = surface_df.apply(
-            lambda r: get_quadrant(r['fixation x [normalized]'], r['fixation y [normalized]']), axis=1
-        )
+            # Merge quadrant info back to main fixation list
+            merged_df = pd.merge(main_df, surface_df[['fixation id', 'quadrant']], on='fixation id', how='left')
+            merged_df['quadrant'] = merged_df['quadrant'].fillna('Off-Surface')
+            merged_df.dropna(subset=['quadrant'], inplace=True)
 
-        # Merge quadrant info onto main fixation data
-        surface_quadrants = surface_df[['fixation id', 'quadrant']]
-        merged_df = pd.merge(main_df, surface_quadrants, on='fixation id', how='left')
-        merged_df['quadrant'] = merged_df['quadrant'].fillna('Off-Surface')
-        merged_df.dropna(subset=['quadrant'], inplace=True)
+            if not merged_df.empty:
+                merged_df['start_time_sec'] = (merged_df['start timestamp [ns]'] - start_time_ns) * 1e-9
+                merged_df['duration_sec'] = merged_df['duration [ms]'] * 1e-3
+                merged_df['end_time_sec'] = merged_df['start_time_sec'] + merged_df['duration_sec']
 
-        if not merged_df.empty:
-            merged_df['start_time_sec'] = (merged_df['start timestamp [ns]'] - start_time_ns) * 1e-9
-            merged_df['end_time_sec'] = (merged_df['end timestamp [ns]'] - start_time_ns) * 1e-9
-            merged_df['duration_sec'] = merged_df['duration [ms]'] * 1e-3
+        # Saccades
+        sacc_ok = False
+        sacc_vel_col = None
+        if saccades_df is not None and not saccades_df.empty:
+            saccades_df = saccades_df.copy()
+            saccades_df['time_sec'] = (saccades_df['start timestamp [ns]'] - start_time_ns) * 1e-9
+            # Auto-detect velocity column
+            for c in ['peak velocity [px/s]', 'peak velocity [deg/s]', 'velocity']:
+                if c in saccades_df.columns:
+                    sacc_vel_col = c
+                    sacc_ok = True
+                    break
 
+        # Blinks
+        blinks_ok = False
+        if blinks_df is not None and not blinks_df.empty:
+            blinks_df = blinks_df.copy()
+            blinks_df['start_time_sec'] = (blinks_df['start timestamp [ns]'] - start_time_ns) * 1e-9
+            blinks_df['duration_sec'] = blinks_df['duration [ms]'] * 1e-3
+            blinks_ok = True
 
-        # Start with Eye Data as the "Master Clock" (Highest Frequency ~200Hz)
+        # --- 2. GENERATE FULL TIMESERIES CSV ---
+
+        # Base timeline on eye data frequency
         timeseries_df = eye_df[['time_sec', 'pupil_diameter_avg', 'eyelid_aperture_avg']].copy()
         timeseries_df.rename(
             columns={'pupil_diameter_avg': 'pupil_diameter_mm', 'eyelid_aperture_avg': 'eyelid_aperture_mm'},
-            inplace=True
-        )
+            inplace=True)
+        timeseries_df.sort_values('time_sec', inplace=True)
 
-        # Merge IMU Data (Backward Fill)
-        # We align IMU data to Eye timestamps by taking the most recent previous IMU value.
-        if head_velocity_available:
-            imu_stream = imu_df[['time_sec', 'head_angular_velocity']].copy()
-            imu_stream.sort_values('time_sec', inplace=True)
-            timeseries_df.sort_values('time_sec', inplace=True)
+        # Merge streams
+        if gaze_ok: timeseries_df = pd.merge_asof(timeseries_df, gaze_stream, on='time_sec', direction='nearest',
+                                                  tolerance=0.01)
 
-            timeseries_df = pd.merge_asof(timeseries_df, imu_stream, on='time_sec', direction='backward')
+        if head_vel_ok:
+            timeseries_df = pd.merge_asof(timeseries_df, imu_df[['time_sec', 'head_angular_velocity']], on='time_sec',
+                                          direction='backward')
             timeseries_df.rename(columns={'head_angular_velocity': 'head_angular_velocity_deg_s'}, inplace=True)
 
-        # Merge Keystrokes (Nearest Neighbor with Tolerance)
-        # We only assign a button press if it happened within 50ms of the eye frame.
-        if keys_available:
-            trial_keys.sort_values('time_sec', inplace=True)
-            timeseries_df.sort_values('time_sec', inplace=True)
+        if keys_ok:
+            timeseries_df = pd.merge_asof(timeseries_df, trial_keys[['time_sec', 'button_pressed']], on='time_sec',
+                                          direction='nearest', tolerance=0.05)
 
-            timeseries_df = pd.merge_asof(
-                timeseries_df,
-                trial_keys,
-                on='time_sec',
-                direction='nearest',
-                tolerance=0.05
-            )
-
-        # Map Fixation IDs to Timestamps
-        # Vectorized lookup to check which fixation interval each timestamp falls into.
+        # Map active fixation/quadrant to timestamp
         if not merged_df.empty:
-            intervals = pd.IntervalIndex.from_arrays(merged_df['start_time_sec'], merged_df['end_time_sec'],
-                                                     closed='both')
             try:
-                indices = intervals.get_indexer(timeseries_df['time_sec'].values)
+                intervals = pd.IntervalIndex.from_arrays(merged_df['start_time_sec'], merged_df['end_time_sec'],
+                                                         closed='both')
+                indices = intervals.get_indexer(timeseries_df['time_sec'])
 
-                # Retrieve source data arrays
-                fix_ids = merged_df['fixation id'].values
-                quadrants = merged_df['quadrant'].values
-
-                # Initialize result arrays
+                valid = indices != -1
                 mapped_ids = np.full(len(timeseries_df), np.nan)
                 mapped_quads = np.full(len(timeseries_df), None, dtype=object)
 
-                # Fill valid matches
-                valid_mask = indices != -1
-                valid_indices = indices[valid_mask]
-                mapped_ids[valid_mask] = fix_ids[valid_indices]
-                mapped_quads[valid_mask] = quadrants[valid_indices]
+                # Assign values where time overlaps
+                mapped_ids[valid] = merged_df['fixation id'].values[indices[valid]]
+                mapped_quads[valid] = merged_df['quadrant'].values[indices[valid]]
 
                 timeseries_df['current_fixation_id'] = mapped_ids
                 timeseries_df['current_quadrant'] = mapped_quads
-            except Exception as e:
-                print(f"   [WARN] Fixation mapping failed: {e}")
+            except:
+                pass
 
-        # Save Clean CSV (Ordered as requested)
-        desired_order = [
-            'time_sec',
-            'eyelid_aperture_mm',
-            'pupil_diameter_mm',
-            'head_angular_velocity_deg_s',
-            'button_pressed',
-            'current_fixation_id',
-            'current_quadrant'
-        ]
-        final_cols = [c for c in desired_order if c in timeseries_df.columns]
+        timeseries_df.to_csv(os.path.join(output_dir, f"{trial_name}_full_timeseries.csv"), index=False)
 
-        raw_csv_path = os.path.join(output_dir, f"{trial_name}_full_timeseries.csv")
-        timeseries_df[final_cols].to_csv(raw_csv_path, index=False)
+        # --- 3. PLOTTING ---
 
-        # Determine necessary subplots
+        color_map = {
+            "Top-Right": '#1f77b4', "Top-Left": '#ff7f0e',
+            "Bottom-Right": '#2ca02c', "Bottom-Left": '#d62728',
+            "Off-Surface": '#7f7f7f'
+        }
+
+        # Helper to stripe background based on quadrants
+        def add_shading(ax):
+            if merged_df.empty: return
+            for _, row in merged_df.iterrows():
+                color = color_map.get(row['quadrant'], 'white')
+                ax.axvspan(row['start_time_sec'], row['end_time_sec'], color=color, alpha=0.15, lw=0)
+
         plots_to_create = {
+            'timeline': not merged_df.empty,
             'aperture': eye_df is not None and not eye_df.empty,
             'pupil': eye_df is not None and not eye_df.empty,
             'fix_duration': not merged_df.empty,
-            'saccades': saccades_df is not None and not saccades_df.empty,
-            'blinks': blinks_df is not None and not blinks_df.empty,
-            'head_velocity': head_velocity_available
+            'saccade_vel': sacc_ok,
+            'head_velocity': head_vel_ok,
+            'blinks': blinks_ok
         }
-        num_plots = 1 + sum(plots_to_create.values())
+        active_plots = [k for k, v in plots_to_create.items() if v]
+        num_plots = len(active_plots)
 
-        fig, axs = plt.subplots(num_plots, 1, figsize=(15, 2.0 * num_plots), sharex=True)
-        if num_plots == 1: axs = [axs]
-        fig.suptitle(f"Cognitive Load Analysis - {trial_name}", fontsize=16)
+        if num_plots > 0:
+            # Wide layout (24), slightly compressed height
+            fig, axs = plt.subplots(num_plots, 1, figsize=(24, 2.5 * num_plots), sharex=True)
+            if num_plots == 1: axs = [axs]
 
-        # Plot Config (Colors/Positions)
-        categories = {
-            "Top-Right": {'y': 4, 'color': '#1f77b4'}, "Top-Left": {'y': 3, 'color': '#ff7f0e'},
-            "Bottom-Right": {'y': 2, 'color': '#2ca02c'}, "Bottom-Left": {'y': 1, 'color': '#d62728'},
-            "Off-Surface": {'y': 0, 'color': '#7f7f7f'}
-        }
+            fig.suptitle(f"Cognitive Load Analysis - {trial_name}", fontsize=18, y=0.95)
+            curr_ax_idx = 0
 
-        # Subplot 0: Visual Attention Timeline
-        if not merged_df.empty:
-            merged_df['y_pos'] = merged_df['quadrant'].apply(lambda q: categories.get(q, {}).get('y'))
-            merged_df['color'] = merged_df['quadrant'].apply(lambda q: categories.get(q, {}).get('color'))
-            axs[0].barh(y=merged_df['y_pos'], width=merged_df['duration_sec'], left=merged_df['start_time_sec'],
-                        color=merged_df['color'], height=0.7)
+            def stylize(ax, ylabel):
+                ax.set_ylabel(ylabel, fontsize=12)
+                ax.tick_params(axis='both', which='major', labelsize=10)
+                ax.grid(True, alpha=0.3)
+                add_shading(ax)
 
-        axs[0].set_yticks(ticks=[cat['y'] for cat in categories.values()])
-        axs[0].set_yticklabels(labels=categories.keys())
-        axs[0].set_title("Timeline of Visual Attention")
-        axs[0].grid(axis='x', linestyle='--', alpha=0.6)
+            # A. Timeline Bar
+            if 'timeline' in active_plots:
+                ax = axs[curr_ax_idx]
+                y_map = {"Top-Right": 4, "Top-Left": 3, "Bottom-Right": 2, "Bottom-Left": 1, "Off-Surface": 0}
+                merged_df['y_pos'] = merged_df['quadrant'].apply(lambda q: y_map.get(q, 0))
+                merged_df['color'] = merged_df['quadrant'].apply(lambda q: color_map.get(q, 'grey'))
 
-        # Add Legend
-        legend_patches = [mpatches.Patch(color=cat['color'], label=name) for name, cat in categories.items()]
-        axs[0].legend(handles=legend_patches, bbox_to_anchor=(1.02, 1.02), loc='upper left')
+                ax.barh(y=merged_df['y_pos'], width=merged_df['duration_sec'], left=merged_df['start_time_sec'],
+                        color=merged_df['color'], height=0.6)
+                ax.set_yticks(list(y_map.values()))
+                ax.set_yticklabels(list(y_map.keys()), fontsize=10)
+                ax.set_title("Timeline of Visual Attention", fontsize=14)
+                ax.grid(axis='x', linestyle=':', alpha=0.5)
+                # No shading on top plot (cleaner look)
+                curr_ax_idx += 1
 
-        # Add colored background spans to all other plots
-        plot_idx = 1
-        if not merged_df.empty:
-            for row in merged_df.itertuples():
-                if pd.notna(row.color):
-                    t_start, t_dur = float(row.start_time_sec), float(row.duration_sec)
-                    for i in range(1, num_plots):
-                        axs[i].axvspan(xmin=t_start, xmax=t_start + t_dur, color=row.color, alpha=0.15, zorder=0)
+            # B. Aperture
+            if 'aperture' in active_plots:
+                ax = axs[curr_ax_idx]
+                ax.plot(eye_df['time_sec'], eye_df['eyelid_aperture_avg'], color='purple', linewidth=2.5)
+                stylize(ax, "Aperture (mm)")
+                curr_ax_idx += 1
 
-        # Draw Metric Plots
-        if plots_to_create['aperture']:
-            axs[plot_idx].plot(eye_df['time_sec'], eye_df['eyelid_aperture_avg'], color='purple', linewidth=1.5)
-            axs[plot_idx].set_ylabel("Aperture (mm)")
-            plot_idx += 1
-        if plots_to_create['pupil']:
-            axs[plot_idx].plot(eye_df['time_sec'], eye_df['pupil_diameter_avg'], color='teal', linewidth=1.5)
-            axs[plot_idx].set_ylabel("Diameter (mm)")
-            plot_idx += 1
-        if plots_to_create['fix_duration']:
-            axs[plot_idx].stem(merged_df['start_time_sec'], merged_df['duration_sec'], linefmt='grey', markerfmt='o',
-                               basefmt=" ")
-            axs[plot_idx].set_ylabel("Duration (s)")
-            plot_idx += 1
-        if plots_to_create['saccades']:
-            saccades_df = saccades_df.copy()
-            saccades_df['start_time_sec'] = (saccades_df['start timestamp [ns]'] - start_time_ns) * 1e-9
-            axs[plot_idx].plot(saccades_df['start_time_sec'], saccades_df['peak velocity [px/s]'], color='darkorange',
-                               marker='.', linestyle='')
-            axs[plot_idx].set_ylabel("Velocity (px/s)")
-            plot_idx += 1
-        if plots_to_create['head_velocity']:
-            axs[plot_idx].plot(imu_df['time_sec'], imu_df['head_angular_velocity'], color='black', linewidth=1.5)
-            axs[plot_idx].set_ylabel("Velocity (deg/s)")
-            plot_idx += 1
-        if plots_to_create['blinks']:
-            for _, blink_row in blinks_df.iterrows():
-                t_b_start = (blink_row['start timestamp [ns]'] - start_time_ns) * 1e-9
-                t_b_end = (blink_row['end timestamp [ns]'] - start_time_ns) * 1e-9
-                axs[plot_idx].axvspan(xmin=t_b_start, xmax=t_b_end, color='crimson', alpha=0.5, label='Blink')
-            axs[plot_idx].set_yticks([])
-            axs[plot_idx].set_ylabel("Blinks")
+            # C. Pupil
+            if 'pupil' in active_plots:
+                ax = axs[curr_ax_idx]
+                ax.plot(eye_df['time_sec'], eye_df['pupil_diameter_avg'], color='teal', linewidth=2.5)
+                stylize(ax, "Diameter (mm)")
+                curr_ax_idx += 1
 
-        axs[-1].set_xlabel("Time (seconds)")
-        fig.tight_layout(rect=(0, 0, 1, 0.98))
+            # D. Duration (Lollipops)
+            if 'fix_duration' in active_plots:
+                ax = axs[curr_ax_idx]
+                ax.vlines(merged_df['start_time_sec'], 0, merged_df['duration_sec'], color='grey', alpha=0.5,
+                          linewidth=1.5)
+                ax.scatter(merged_df['start_time_sec'], merged_df['duration_sec'], color='grey', s=50)
+                stylize(ax, "Duration (s)")
+                curr_ax_idx += 1
 
-        timeline_plot_path = os.path.join(output_dir, f"{trial_name}_timeline_plot.png")
-        fig.savefig(timeline_plot_path)
-        plt.close(fig)
+            # E. Saccade Velocity
+            if 'saccade_vel' in active_plots:
+                ax = axs[curr_ax_idx]
+                ax.plot(saccades_df['time_sec'], saccades_df[sacc_vel_col], color='darkorange', marker='.',
+                        linestyle='None', alpha=0.8, markersize=8)
+                stylize(ax, f"Velocity\n({sacc_vel_col.split('[')[-1][:-1]})")
+                curr_ax_idx += 1
+
+            # F. Head Velocity
+            if 'head_velocity' in active_plots:
+                ax = axs[curr_ax_idx]
+                ax.plot(imu_df['time_sec'], imu_df['head_angular_velocity'], color='black', linewidth=2)
+                stylize(ax, "Head Vel (deg/s)")
+                curr_ax_idx += 1
+
+            # G. Blinks
+            if 'blinks' in active_plots:
+                ax = axs[curr_ax_idx]
+                for _, row in blinks_df.iterrows():
+                    ax.axvspan(row['start_time_sec'], row['start_time_sec'] + row['duration_sec'], color='red',
+                               alpha=0.5)
+                    ax.axvline(row['start_time_sec'], color='red', linewidth=0.5, alpha=0.8)
+                ax.set_yticks([])
+                ax.set_ylabel("Blinks", fontsize=12)
+                add_shading(ax)
+                curr_ax_idx += 1
+
+            axs[-1].set_xlabel("Time (seconds)", fontsize=12)
+            legend_patches = [mpatches.Patch(color=c, label=l) for l, c in color_map.items()]
+            axs[0].legend(handles=legend_patches, bbox_to_anchor=(1.01, 1.05), loc='upper left', fontsize=10)
+
+            # Pad top to ensure title visibility
+            fig.tight_layout(rect=[0, 0.02, 1, 0.92])
+
+            fig.savefig(os.path.join(output_dir, f"{trial_name}_timeline_plot.png"), dpi=100)
+            plt.close(fig)
 
         return generate_summary_stats(merged_df, eye_df, saccades_df, imu_df, output_dir, trial_name)
 
     except Exception as e:
-        print(f"   [ERROR] Crash during analysis of {trial_name}: {e}")
+        print(f"   Analysis failed: {e}")
         traceback.print_exc()
+        plt.close('all')
         return None
 
 
-def generate_trend_plots(df, output_dir, session_label=""):
-    """
-    Generates a 2x5 grid of trend plots showing how metrics change across trial numbers.
-    This visualizes the "Learning Curve" of the user.
-    """
-    try:
-        metric_config = {
-            'pupil_diameter': {'color': 'teal', 'unit': 'mm'},
-            'eyelid_aperture': {'color': 'purple', 'unit': 'mm'},
-            'fixation_duration': {'color': 'grey', 'unit': 's'},
-            'saccadic_velocity': {'color': 'darkorange', 'unit': 'px/s'},
-            'head_velocity': {'color': 'black', 'unit': 'deg/s'}
-        }
-
-        # Setup Grid
-        base_names = list(metric_config.keys())
-        nrows = 2
-        ncols = 5
-        fig, axs = plt.subplots(nrows, ncols, figsize=(22, 8), sharex=True)
-        title_text = f"Metrics Across Trials (Learning Curve) - {session_label}" if session_label else "Metrics Across Trials"
-        fig.suptitle(title_text, fontsize=16)
-
-        # Loop through metrics and plot Peak (Row 0) and Average (Row 1)
-        for col_idx, base_name in enumerate(base_names):
-            config = metric_config[base_name]
-            color = config['color']
-            unit = config['unit']
-            peak_metric = f"peak_{base_name}_{unit.replace('/', '_')}"
-            avg_metric = f"avg_{base_name}_{unit.replace('/', '_')}"
-
-            # Plot Peak Trend
-            ax_peak = axs[0, col_idx]
-            if peak_metric in df.columns:
-                x_data = df['trial_num']
-                y_data = df[peak_metric].fillna(df[peak_metric].mean())
-                ax_peak.plot(x_data, y_data, marker='o', linestyle='--', color=color)
-                # Trendline
-                if len(x_data) > 1:
-                    m, b = np.polyfit(x_data, y_data, 1)
-                    ax_peak.plot(x_data, m * x_data + b, color=color, linestyle=':', alpha=0.7)
-                ax_peak.set_title(f"Peak {base_name.replace('_', ' ').title()}")
-                ax_peak.set_ylabel(unit)
-                ax_peak.grid(True, linestyle='--')
-            else:
-                ax_peak.axis('off')
-
-            # Plot Average Trend
-            ax_avg = axs[1, col_idx]
-            if avg_metric in df.columns:
-                x_data = df['trial_num']
-                y_data = df[avg_metric].fillna(df[avg_metric].mean())
-                ax_avg.plot(x_data, y_data, marker='o', linestyle='-', color=color)
-                # Trendline
-                if len(x_data) > 1:
-                    m, b = np.polyfit(x_data, y_data, 1)
-                    ax_avg.plot(x_data, m * x_data + b, color=color, linestyle=':', alpha=0.7)
-                ax_avg.set_title(f"Average {base_name.replace('_', ' ').title()}")
-                ax_avg.set_ylabel(unit)
-                ax_avg.grid(True, linestyle='--')
-                ax_avg.set_xlabel("Trial Number")
-            else:
-                ax_avg.axis('off')
-
-        # Clean up empty columns
-        for col_idx in range(len(base_names), ncols):
-            axs[0, col_idx].axis('off')
-            axs[1, col_idx].axis('off')
-
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-        plot_path = os.path.join(output_dir,
-                                 f"{session_label}_trend_plots.png" if session_label else "all_trials_trend_plots.png")
-        fig.savefig(plot_path)
-        print(f"Trend Plots saved to: {plot_path}")
-        plt.close(fig)
-    except Exception as e:
-        print(f"[ERROR] Failed to generate trend plots: {e}")
-
+# --- MAIN ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Process Pupil Labs Eye Tracking data synced with ROS/LSL.")
-    parser.add_argument("--main-dir", required=True, help="Path to main Pupil Export (folder containing fixations.csv)")
-    parser.add_argument("--surface-dir", required=True, help="Path to surface folder")
-    parser.add_argument("--keystroke-file", required=True, help="Path to Master Keystrokes CSV (Ground Truth)")
-    parser.add_argument("--lsl-dir", required=True, help="Path to FOLDER containing all LSL files")
-    parser.add_argument("--exclude", nargs='+', type=int, default=[], help="Trial numbers to exclude from report")
-    parser.add_argument("--session-id", type=str, default="", help="Optional identifier string for file naming")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--main-dir", required=True)
+    parser.add_argument("--surface-dir", required=True)
+    parser.add_argument("--keystroke-file", required=True)
+    parser.add_argument("--lsl-dir", required=True)
+    parser.add_argument("--session-id", default="")
     args = parser.parse_args()
 
+    print("Loading data...")
     try:
-        # Define paths
-        fixations_file = os.path.join(args.main_dir, "fixations.csv")
-        surface_fixations_file = os.path.join(args.surface_dir, "fixations.csv")
-        eye_states_file = os.path.join(args.main_dir, "3d_eye_states.csv")
-        blinks_file = os.path.join(args.main_dir, "blinks.csv")
-        saccades_file = os.path.join(args.main_dir, "saccades.csv")
-        imu_file = os.path.join(args.main_dir, "imu.csv")
+        gaze_path = os.path.join(args.main_dir, "gaze.csv")
+        if not os.path.exists(gaze_path): sys.exit(f"Error: gaze.csv not found in {args.main_dir}")
 
-        # Load Dataframes
-        all_main_df = pd.read_csv(fixations_file)
-        all_surface_df = pd.read_csv(surface_fixations_file)
-        all_eye_df = pd.read_csv(eye_states_file)
-        # Load optional files safely
-        all_blinks_df = pd.read_csv(blinks_file) if os.path.exists(blinks_file) else None
-        all_saccades_df = pd.read_csv(saccades_file) if os.path.exists(saccades_file) else None
-        all_imu_df = pd.read_csv(imu_file) if os.path.exists(imu_file) else None
-
-        # Load Master Keystrokes
+        all_gaze_df = pd.read_csv(gaze_path)
+        all_eye_df = pd.read_csv(os.path.join(args.main_dir, "3d_eye_states.csv"))
+        all_main_df = pd.read_csv(os.path.join(args.main_dir, "fixations.csv"))
+        all_surface_df = pd.read_csv(os.path.join(args.surface_dir, "fixations.csv"))
         keystrokes_df = pd.read_csv(args.keystroke_file)
 
-    except FileNotFoundError as e:
-        sys.exit(f"[FATAL ERROR] Missing file: {e.filename}")
-    except Exception as e:
-        sys.exit(f"[FATAL ERROR] Error reading file: {e}")
+        # Optional files
+        sacc_path = os.path.join(args.main_dir, "saccades.csv")
+        all_saccades_df = pd.read_csv(sacc_path) if os.path.exists(sacc_path) else None
 
+        blinks_path = os.path.join(args.main_dir, "blinks.csv")
+        all_blinks_df = pd.read_csv(blinks_path) if os.path.exists(blinks_path) else None
+
+        imu_path = os.path.join(args.main_dir, "imu.csv")
+        all_imu_df = pd.read_csv(imu_path) if os.path.exists(imu_path) else None
+
+    except Exception as e:
+        sys.exit(f"Load error: {e}")
+
+    # Output setup
     root_dir = os.path.dirname(args.main_dir)
-    folder_name = f"{args.session_id}_Analysis_Output" if args.session_id else "Analysis_Output"
-    master_output_dir = os.path.join(root_dir, folder_name)
-    os.makedirs(master_output_dir, exist_ok=True)
-    print(f"Output will be saved to: {master_output_dir}")
+    out_folder = f"{args.session_id}_Analysis_Output" if args.session_id else "Analysis_Output"
+    master_out = os.path.join(root_dir, out_folder)
+    os.makedirs(master_out, exist_ok=True)
 
-    # Helper function for time slicing
-    def slice_df(df, start, end, time_col):
-        if df is None: return None
-        return df[(df[time_col] >= start) & (df[time_col] <= end)].copy()
-
-    start_events = keystrokes_df[keystrokes_df['event'] == 'start_recording'].copy()
-    all_trial_summaries = []
-
-    try:
-        trial0_row = start_events[start_events['trial'] == 0]
-
-        if not trial0_row.empty:
-            # Use Trial 0's start time as the END of the baseline period.
-            trial0_ros_time = float(trial0_row.iloc[0]['ros_time'])
-
-            lsl_file_path = find_lsl_file_for_trial(args.lsl_dir, 0)
-            if lsl_file_path:
-                lsl_df = pd.read_csv(lsl_file_path)
-                # Find closest LSL row to Trial 0 Start for sync offset
-                time_diffs = (lsl_df['ros_time'] - trial0_ros_time).abs()
-                lsl_sync_row = lsl_df.iloc[int(time_diffs.idxmin())]
-
-                # Offset = Glasses_Time - Robot_Time
-                offset_ns = lsl_sync_row['sys_utc_ns'].item() - (lsl_sync_row['ros_time'].item() * 1e9)
-
-                # Baseline End = Start of Trial 0 (in Glasses Time)
-                baseline_end_ns = int((trial0_ros_time * 1e9) + offset_ns)
-                # Baseline Start = Very first recorded timestamp in eye data
-                baseline_start_ns = int(all_eye_df['timestamp [ns]'].min().item())
-
-                # Create Directory
-                baseline_name = f"{args.session_id}_Baseline" if args.session_id else "Baseline"
-                baseline_output_dir = os.path.join(master_output_dir, f"{baseline_name}_Analysis")
-                os.makedirs(baseline_output_dir, exist_ok=True)
-
-                # Slice Data
-                base_main_df = slice_df(all_main_df, baseline_start_ns, baseline_end_ns, 'start timestamp [ns]')
-                base_surface_df = slice_df(all_surface_df, baseline_start_ns, baseline_end_ns, 'start timestamp [ns]')
-                base_eye_df = slice_df(all_eye_df, baseline_start_ns, baseline_end_ns, 'timestamp [ns]')
-                base_blinks_df = slice_df(all_blinks_df, baseline_start_ns, baseline_end_ns, 'start timestamp [ns]')
-                base_saccades_df = slice_df(all_saccades_df, baseline_start_ns, baseline_end_ns, 'start timestamp [ns]')
-                base_imu_df = slice_df(all_imu_df, baseline_start_ns, baseline_end_ns, 'timestamp [ns]')
-
-                # Keys during baseline
-                base_keys = keystrokes_df.copy()
-                base_keys['timestamp [ns]'] = (base_keys['ros_time'] * 1e9) + offset_ns
-                base_keys = slice_df(base_keys, baseline_start_ns, baseline_end_ns, 'timestamp [ns]')
-
-                # Analyze
-                if not base_eye_df.empty:
-                    analyze_trial(
-                        baseline_name, base_main_df, base_surface_df, base_eye_df,
-                        base_blinks_df, base_saccades_df, base_imu_df, base_keys,
-                        baseline_output_dir
-                    )
-                    print("Baseline Analysis Complete.")
-                else:
-                    print("[ERROR] No eye data found for baseline period.")
-            else:
-                print("[ERROR] Missing LSL file for Trial 0. Cannot sync baseline.")
-        else:
-            print("[ERROR] Trial 0 start event not found.")
-
-    except Exception as e:
-        print(f"[ERROR] Failed to process baseline: {e}")
-        traceback.print_exc()
-
+    # Get chronologically sorted trials
+    start_events = keystrokes_df[keystrokes_df['event'] == 'start_recording'].sort_values('ros_time')
     print(f"Found {len(start_events)} trials.")
 
-    for start_row in start_events.itertuples(index=False):
-        trial_name = "Unknown_Trial"
-        try:
-            # Identification
-            trial_num = int(start_row.trial)
-            base_trial_name = f"Trial_{trial_num}"
-            trial_name = f"{args.session_id}_{base_trial_name}" if args.session_id else base_trial_name
+    # --- BASELINE LOGIC ---
+    # Find the first "Meaningful" trial (>5s) to act as the anchor.
+    # The baseline will run from recording start -> start of Anchor Trial.
+    if not start_events.empty:
+        print("\nRunning Baseline...")
 
-            ros_start_time = float(start_row.ros_time)
-            print(f"Processing {trial_name}")
+        anchor_row = None
+        anchor_trial_num = -1
 
-            # Synchronization
-            lsl_file_path = find_lsl_file_for_trial(args.lsl_dir, trial_num)
-            if not lsl_file_path:
-                print(f"[ERROR] No LSL file found for Trial {trial_num}. Skipping.")
-                continue
+        for row in start_events.itertuples():
+            t_num = row.trial
+            # Calculate duration
+            stop_row = keystrokes_df[(keystrokes_df['event'] == 'stop_recording') & (keystrokes_df['trial'] == t_num)]
 
-            lsl_df = pd.read_csv(lsl_file_path)
-            time_diffs = (lsl_df['ros_time'] - ros_start_time).abs()
-            lsl_sync_row = lsl_df.iloc[int(time_diffs.idxmin())]
+            duration = 0
+            if not stop_row.empty:
+                duration = float(stop_row.iloc[0]['ros_time']) - float(row.ros_time)
 
-            offset_ns = lsl_sync_row['sys_utc_ns'].item() - (lsl_sync_row['ros_time'].item() * 1e9)
-
-            # Boundaries
-            start_ns = int((ros_start_time * 1e9) + offset_ns)
-
-            stop_rows = keystrokes_df[
-                (keystrokes_df['event'] == 'stop_recording') &
-                (keystrokes_df['trial'] == trial_num)
-                ]
-
-            if not stop_rows.empty:
-                ros_end_time = float(stop_rows['ros_time'].values[0])
-                end_ns = int((ros_end_time * 1e9) + offset_ns)
+            # If valid trial found, lock it
+            if duration > 5.0:
+                anchor_row = row
+                anchor_trial_num = int(t_num)
+                print(f"   Anchor: Trial {anchor_trial_num} ({duration:.1f}s)")
+                break
             else:
-                # Default to 60s if stop event missing
-                end_ns = start_ns + int(60 * 1e9)
+                print(f"   Skipping Trial {t_num} (too short: {duration:.1f}s)")
 
-            # Keys for this trial
-            trial_keys = keystrokes_df[keystrokes_df['trial'] == trial_num].copy()
-            trial_keys['timestamp [ns]'] = (trial_keys['ros_time'] * 1e9) + offset_ns
+        if anchor_row is not None:
+            anchor_start_ros = float(anchor_row.ros_time)
+            lsl_file = find_lsl_file_for_trial(args.lsl_dir, anchor_trial_num)
 
-            # Slicing
-            trial_output_dir = os.path.join(master_output_dir, f"{trial_name}_Analysis")
-            os.makedirs(trial_output_dir, exist_ok=True)
+            if lsl_file:
+                # Sync based on anchor
+                baseline_offset_ns = calculate_offset_via_fingerprint(lsl_file, all_gaze_df)
 
-            trial_main_df = slice_df(all_main_df, start_ns, end_ns, 'start timestamp [ns]')
-            if trial_main_df.empty:
-                print(f"[ERROR] Slice returned 0 rows! Check Sync.")
-                continue
+                if baseline_offset_ns is not None:
+                    # Define Window
+                    baseline_end_ns = int((anchor_start_ros * 1e9) + baseline_offset_ns)
+                    baseline_start_ns = int(all_gaze_df.iloc[0]['timestamp [ns]'])
 
-            trial_surface_df = slice_df(all_surface_df, start_ns, end_ns, 'start timestamp [ns]')
-            trial_eye_df = slice_df(all_eye_df, start_ns, end_ns, 'timestamp [ns]')
-            trial_blinks_df = slice_df(all_blinks_df, start_ns, end_ns, 'start timestamp [ns]')
-            trial_saccades_df = slice_df(all_saccades_df, start_ns, end_ns, 'start timestamp [ns]')
-            trial_imu_df = slice_df(all_imu_df, start_ns, end_ns, 'timestamp [ns]')
+                    baseline_name = f"{args.session_id}_Baseline" if args.session_id else "Baseline"
+                    trial_out_dir = os.path.join(master_out, f"{baseline_name}_Analysis")
+                    os.makedirs(trial_out_dir, exist_ok=True)
 
-            # Analysis
-            summary_data = analyze_trial(
-                trial_name, trial_main_df, trial_surface_df, trial_eye_df,
-                trial_blinks_df, trial_saccades_df, trial_imu_df,
-                trial_keys,
-                trial_output_dir
-            )
+                    # Helper to slice dataframe by timestamp
+                    def slice_baseline(df, t_col='timestamp [ns]'):
+                        return df[(df[t_col] >= baseline_start_ns) & (
+                                    df[t_col] <= baseline_end_ns)] if df is not None else None
 
-            if summary_data is not None:
-                if trial_num in args.exclude:
-                    print(f"Trial {trial_num} excluded from Master Report.")
+                    # Slice & Save raw chunks
+                    sub_gaze = slice_baseline(all_gaze_df)
+                    if sub_gaze is not None: sub_gaze.to_csv(
+                        os.path.join(trial_out_dir, f"{baseline_name}_raw_gaze_slice.csv"), index=False)
+
+                    sub_eye = slice_baseline(all_eye_df)
+                    if sub_eye is not None: sub_eye.to_csv(
+                        os.path.join(trial_out_dir, f"{baseline_name}_raw_3d_eye_states_slice.csv"), index=False)
+
+                    sub_main = slice_baseline(all_main_df, 'start timestamp [ns]')
+                    if sub_main is not None: sub_main.to_csv(
+                        os.path.join(trial_out_dir, f"{baseline_name}_raw_fixations_slice.csv"), index=False)
+
+                    sub_sacc = slice_baseline(all_saccades_df, 'start timestamp [ns]')
+                    if sub_sacc is not None: sub_sacc.to_csv(
+                        os.path.join(trial_out_dir, f"{baseline_name}_raw_saccades_slice.csv"), index=False)
+
+                    # Slice streams for analysis
+                    sub_surf = slice_baseline(all_surface_df, 'start timestamp [ns]')
+                    sub_imu = slice_baseline(all_imu_df)
+                    sub_blinks = slice_baseline(all_blinks_df, 'start timestamp [ns]')
+
+                    sub_keys = keystrokes_df[keystrokes_df['ros_time'] < anchor_start_ros].copy()
+                    sub_keys['timestamp [ns]'] = (sub_keys['ros_time'] * 1e9) + baseline_offset_ns
+
+                    analyze_trial(baseline_name, sub_main, sub_surf, sub_eye, sub_blinks, sub_sacc, sub_imu, sub_gaze,
+                                  sub_keys, trial_out_dir)
+                    print("   Baseline complete.")
                 else:
-                    summary_data['trial_num'] = trial_num
-                    all_trial_summaries.append(summary_data)
+                    print(f"   Baseline skipped: Sync failed for Anchor Trial {anchor_trial_num}.")
+            else:
+                print(f"   Baseline skipped: No LSL file for Anchor Trial {anchor_trial_num}.")
+        else:
+            print("   Baseline skipped: No valid anchor trial found.")
 
-        except Exception as e:
-            print(f"[ERROR] Skipping {trial_name} due to unexpected error: {e}")
-            traceback.print_exc()
+    # --- PROCESS TRIALS ---
+    for row in start_events.itertuples(index=False):
+        trial_num = int(row.trial)
+        trial_name = f"{args.session_id}_Trial_{trial_num}" if args.session_id else f"Trial_{trial_num}"
+        print(f"\nProcessing {trial_name}...")
 
-    if all_trial_summaries:
-        master_summary_df = pd.concat(all_trial_summaries).sort_values('trial_num')
-        summary_filename = f"{args.session_id}_summary_report.csv" if args.session_id else "all_trials_summary_report.csv"
-        master_summary_path = os.path.join(master_output_dir, summary_filename)
-        master_summary_df.to_csv(master_summary_path, index=False)
-        print(f"Master Summary saved to: {master_summary_path}")
+        lsl_file = find_lsl_file_for_trial(args.lsl_dir, trial_num)
+        if not lsl_file:
+            print("   Skipping: No LSL file.")
+            continue
 
-        generate_trend_plots(master_summary_df, master_output_dir, args.session_id)
-    else:
-        print("[WARN] No trials were successfully analyzed.")
+        offset_ns = calculate_offset_via_fingerprint(lsl_file, all_gaze_df)
+        if offset_ns is None:
+            print("   Skipping: Sync failed.")
+            continue
+
+        # Define time window
+        ros_start = float(row.ros_time)
+        start_ns = int((ros_start * 1e9) + offset_ns)
+
+        stop_row = keystrokes_df[(keystrokes_df['event'] == 'stop_recording') & (keystrokes_df['trial'] == trial_num)]
+        if not stop_row.empty:
+            end_ns = int((float(stop_row.iloc[0]['ros_time']) * 1e9) + offset_ns)
+        else:
+            # Fallback duration if stop event missing
+            end_ns = start_ns + int(60 * 1e9)
+
+        trial_out_dir = os.path.join(master_out, f"{trial_name}_Analysis")
+        os.makedirs(trial_out_dir, exist_ok=True)
+
+        def slice_df(df, t_col='timestamp [ns]'):
+            return df[(df[t_col] >= start_ns) & (df[t_col] <= end_ns)] if df is not None else None
+
+        # Slice and save raw data
+        sub_gaze = slice_df(all_gaze_df)
+        if sub_gaze is not None: sub_gaze.to_csv(os.path.join(trial_out_dir, f"{trial_name}_raw_gaze_slice.csv"),
+                                                 index=False)
+
+        sub_eye = slice_df(all_eye_df)
+        if sub_eye is not None: sub_eye.to_csv(os.path.join(trial_out_dir, f"{trial_name}_raw_3d_eye_states_slice.csv"),
+                                               index=False)
+
+        sub_main = slice_df(all_main_df, 'start timestamp [ns]')
+        if sub_main is not None: sub_main.to_csv(os.path.join(trial_out_dir, f"{trial_name}_raw_fixations_slice.csv"),
+                                                 index=False)
+
+        sub_sacc = slice_df(all_saccades_df, 'start timestamp [ns]')
+        if sub_sacc is not None: sub_sacc.to_csv(os.path.join(trial_out_dir, f"{trial_name}_raw_saccades_slice.csv"),
+                                                 index=False)
+
+        sub_surf = slice_df(all_surface_df, 'start timestamp [ns]')
+        sub_imu = slice_df(all_imu_df)
+        sub_blinks = slice_df(all_blinks_df, 'start timestamp [ns]')
+
+        sub_keys = keystrokes_df[keystrokes_df['trial'] == trial_num].copy()
+        sub_keys['timestamp [ns]'] = (sub_keys['ros_time'] * 1e9) + offset_ns
+
+        analyze_trial(trial_name, sub_main, sub_surf, sub_eye, sub_blinks, sub_sacc, sub_imu, sub_gaze, sub_keys,
+                      trial_out_dir)
+
+    print("\nAll tasks completed.")
 
 
 if __name__ == "__main__":
