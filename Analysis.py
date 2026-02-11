@@ -22,93 +22,110 @@ def find_lsl_file_for_trial(lsl_dir, trial_num):
         return None
 
 
-def calculate_offset_via_fingerprint(lsl_path, gaze_df, sequence_length=500):
+def calculate_offset_via_fingerprint(lsl_path, gaze_df, sequence_length=None, search_window_sec=5):
     """
-    Finds the exact time offset between LSL (ROS time) and Glasses (ns)
-    using a coarse-to-fine shape matching approach.
+    UPDATED: Global Best Fit Approach.
+    1. Loads the ENTIRE LSL file (minus startup noise).
+    2. Uses the approximate timestamp to find the search region in Gaze data.
+    3. Slides the FULL LSL sequence over the Gaze data to find the global minimum error.
+    4. Returns (None, None) on failure to prevent unpacking crashes.
     """
     try:
         lsl_df = pd.read_csv(lsl_path)
-        if lsl_df.empty: return None
+        if lsl_df.empty: return None, None
 
-        # Identify columns based on unit type
-        lsl_x, lsl_y = 'neon_ch0', 'neon_ch1'
+        # 1. Setup Data Arrays
+        lsl_vals = lsl_df[['neon_ch0', 'neon_ch1']].values
+
+        # Handle normalized vs pixel columns automatically
         if 'gaze x [normalized]' in gaze_df.columns:
-            gaze_x, gaze_y = 'gaze x [normalized]', 'gaze y [normalized]'
+            gaze_vals = gaze_df[['gaze x [normalized]', 'gaze y [normalized]']].values
         else:
-            gaze_x, gaze_y = 'gaze x [px]', 'gaze y [px]'
+            # Fallback for raw columns (normalize them 0-1)
+            gx = gaze_df['gaze x [px]'].values
+            gy = gaze_df['gaze y [px]'].values
+            gx = (gx - np.nanmin(gx)) / (np.nanmax(gx) - np.nanmin(gx) + 1e-9)
+            gy = (gy - np.nanmin(gy)) / (np.nanmax(gy) - np.nanmin(gy) + 1e-9)
+            gaze_vals = np.column_stack((gx, gy))
 
-        lsl_arr = lsl_df[[lsl_x, lsl_y]].values
-        gaze_arr = gaze_df[[gaze_x, gaze_y]].values
+        # 2. Extract Template (Global Sequence)
+        # We skip the first ~50 samples (approx 0.25s) just to avoid potential file-write startup zeros
+        start_buffer = 50
+        if len(lsl_vals) < start_buffer + 100:
+            # Data too short to match safely
+            return None, None
 
-        # Grab a template chunk from LSL.
-        # Offset by 200 samples to avoid startup flatlines/noise.
-        start_offset = 200
-        if len(lsl_arr) < start_offset + sequence_length:
-            return None
+            # USE THE WHOLE FILE
+        template = lsl_vals[start_buffer:]
+        match_len = len(template)
 
-        template = lsl_arr[start_offset: start_offset + sequence_length]
-
-        # Normalize template (0-1) to handle unit mismatch
-        t_min, t_max = template.min(axis=0), template.max(axis=0)
+        # Normalize Template (0-1) for shape matching
+        t_min, t_max = np.nanmin(template, axis=0), np.nanmax(template, axis=0)
         template_norm = (template - t_min) / (t_max - t_min + 1e-9)
 
-        gaze_len = len(gaze_arr)
+        # 3. Find Search Window (The Constraint)
+        # We look at the timestamp of where our template starts (index 50)
+        if 'ros_time' in lsl_df.columns:
+            lsl_time_sec = lsl_df.iloc[start_buffer]['ros_time']
+        elif 'evt_time' in lsl_df.columns:
+            lsl_time_sec = lsl_df.iloc[start_buffer]['evt_time']
+        else:
+            return None, None
 
-        # --- PASS 1: Coarse Search (Speed) ---
-        # Skip 100 samples at a time to find the rough neighborhood
-        coarse_stride = 100
-        best_coarse_err = float('inf')
-        best_coarse_idx = -1
+        target_ns = int(lsl_time_sec * 1e9)
 
-        for i in range(0, gaze_len - sequence_length, coarse_stride):
-            segment = gaze_arr[i: i + sequence_length]
+        file_start_ns = gaze_df['timestamp [ns]'].min()
+        file_end_ns = gaze_df['timestamp [ns]'].max()
 
-            # Local normalization
-            s_min, s_max = segment.min(axis=0), segment.max(axis=0)
+        # If the target time is completely outside the file, fail early
+        if target_ns < file_start_ns or target_ns > file_end_ns: return None, None
+
+        # Find index in Gaze DF closest to this timestamp
+        approx_idx = gaze_df['timestamp [ns]'].searchsorted(target_ns)
+
+        # Define window indices (approx 200Hz * seconds)
+        window_samples = int(search_window_sec * 200)
+
+        # Start looking 'window_samples' BEFORE the timestamp
+        search_start = max(0, approx_idx - window_samples)
+
+        # Stop looking 'window_samples' AFTER the timestamp
+        # Important: Ensure the segment we pull from gaze fits the FULL template length
+        search_end = min(len(gaze_vals) - match_len, approx_idx + window_samples)
+
+        if search_end <= search_start:
+            return None, None
+
+        # 4. Pattern Match (Global Sliding Window)
+        best_err = float('inf')
+        best_idx = -1
+
+        # Stride of 3 for speed (since we are matching thousands of points)
+        for i in range(search_start, search_end, 3):
+            # Extract segment of SAME LENGTH as the full LSL file
+            segment = gaze_vals[i: i + match_len]
+
+            # Normalize Segment
+            s_min, s_max = np.nanmin(segment, axis=0), np.nanmax(segment, axis=0)
             segment_norm = (segment - s_min) / (s_max - s_min + 1e-9)
 
+            # Mean Absolute Error (MAE)
             error = np.mean(np.abs(segment_norm - template_norm))
 
-            if error < best_coarse_err:
-                best_coarse_err = error
-                best_coarse_idx = i
+            if error < best_err:
+                best_err = error
+                best_idx = i
 
-        if best_coarse_idx == -1: return None
+        # 5. Return Offset
+        if best_idx != -1:
+            found_ns = gaze_df.iloc[best_idx]['timestamp [ns]']
+            confidence = max(0, 1.0 - best_err) * 100
+            return (found_ns - target_ns), confidence
 
-        # --- PASS 2: Fine Search (Precision) ---
-        # Search every sample around the coarse match
-        radius = coarse_stride
-        start_fine = max(0, best_coarse_idx - radius)
-        end_fine = min(gaze_len - sequence_length, best_coarse_idx + radius)
-
-        best_fine_err = float('inf')
-        best_fine_idx = -1
-
-        for i in range(start_fine, end_fine):
-            segment = gaze_arr[i: i + sequence_length]
-
-            # Re-normalize for exact precision
-            s_min, s_max = segment.min(axis=0), segment.max(axis=0)
-            segment_norm = (segment - s_min) / (s_max - s_min + 1e-9)
-
-            error = np.mean(np.abs(segment_norm - template_norm))
-
-            if error < best_fine_err:
-                best_fine_err = error
-                best_fine_idx = i
-
-        # Calculate final offset if match is found
-        if best_fine_idx != -1:
-            lsl_ros_time = lsl_df.iloc[start_offset]['ros_time']
-            gaze_ns = gaze_df.iloc[best_fine_idx]['timestamp [ns]']
-            ros_ns = int(lsl_ros_time * 1e9)
-
-            return gaze_ns - ros_ns
-
-        return None
-    except Exception:
-        return None
+        return None, None
+    except Exception as e:
+        print(f"Sync Error: {e}")
+        return None, None
 
 
 def get_quadrant(x, y):
@@ -510,9 +527,13 @@ def main():
 
             if lsl_file:
                 # Sync based on anchor
-                baseline_offset_ns = calculate_offset_via_fingerprint(lsl_file, all_gaze_df)
+                baseline_offset_ns, confidence = None, None
+                sync_result = calculate_offset_via_fingerprint(lsl_file, all_gaze_df)
+                if sync_result is not None:
+                    baseline_offset_ns, confidence = sync_result
 
                 if baseline_offset_ns is not None:
+                    print(f"   Baseline Sync: Success. Offset: {baseline_offset_ns} ns")
                     # Define Window
                     baseline_end_ns = int((anchor_start_ros * 1e9) + baseline_offset_ns)
                     baseline_start_ns = int(all_gaze_df.iloc[0]['timestamp [ns]'])
@@ -524,7 +545,7 @@ def main():
                     # Helper to slice dataframe by timestamp
                     def slice_baseline(df, t_col='timestamp [ns]'):
                         return df[(df[t_col] >= baseline_start_ns) & (
-                                    df[t_col] <= baseline_end_ns)] if df is not None else None
+                                df[t_col] <= baseline_end_ns)] if df is not None else None
 
                     # Slice & Save raw chunks
                     sub_gaze = slice_baseline(all_gaze_df)
@@ -565,23 +586,45 @@ def main():
     for row in start_events.itertuples(index=False):
         trial_num = int(row.trial)
         trial_name = f"{args.session_id}_Trial_{trial_num}" if args.session_id else f"Trial_{trial_num}"
-        print(f"\nProcessing {trial_name}...")
+        print(f"\nProcessing {trial_name}...", end=" ")
+
+        # ---------------------------------------------------------
+        # NEW FIX: IGNORE SHORT TRIALS (LIKE TRIAL 0)
+        # ---------------------------------------------------------
+        # Calculate duration again to check if it's worth processing
+        stop_row = keystrokes_df[(keystrokes_df['event'] == 'stop_recording') & (keystrokes_df['trial'] == trial_num)]
+
+        if not stop_row.empty:
+            duration = float(stop_row.iloc[0]['ros_time']) - float(row.ros_time)
+            if duration < 5.0:
+                print(f"[WARNING] Short Duration: {duration:.2f}s (Check manually!)...", end=" ")
+        # ---------------------------------------------------------
 
         lsl_file = find_lsl_file_for_trial(args.lsl_dir, trial_num)
         if not lsl_file:
-            print("   Skipping: No LSL file.")
+            print("Skipping: No LSL file.")
             continue
 
-        offset_ns = calculate_offset_via_fingerprint(lsl_file, all_gaze_df)
-        if offset_ns is None:
-            print("   Skipping: Sync failed.")
+        # ----------------- SAFER SYNC CALL -----------------
+        # This fixes the unpacking error for Trial 0
+        sync_result = calculate_offset_via_fingerprint(lsl_file, all_gaze_df)
+
+        if sync_result is None:
+            print("Skipping: Sync failed (Trial too short or empty).")
             continue
+
+        offset_ns, confidence = sync_result
+        if offset_ns is None:
+            print("Skipping: Sync failed (No matching shape found).")
+            continue
+        # ---------------------------------------------------
+
+        print(f"Synced. Offset: {offset_ns} ns | Match: {confidence:.1f}%")
 
         # Define time window
         ros_start = float(row.ros_time)
         start_ns = int((ros_start * 1e9) + offset_ns)
 
-        stop_row = keystrokes_df[(keystrokes_df['event'] == 'stop_recording') & (keystrokes_df['trial'] == trial_num)]
         if not stop_row.empty:
             end_ns = int((float(stop_row.iloc[0]['ros_time']) * 1e9) + offset_ns)
         else:
