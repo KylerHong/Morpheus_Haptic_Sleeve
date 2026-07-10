@@ -28,4 +28,4 @@ rosbag should be generated
 IN TERMINAL
 
 to unlock the files, in terminal (!! - navigate to bear@BEAR): 
-`sudo chown -R $USER:$USER ~morpheus_git/Morpheus/morpheus_data/data/[YYYYMMDD]_[SUBJECT]_Session[X]`
+`sudo chown -R $USER:$USER ~/morpheus_git/Morpheus/morpheus_data/data/[YYYYMMDD]_[SUBJECT]_Session[X]`
